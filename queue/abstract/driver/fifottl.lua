@@ -17,7 +17,8 @@ local i_ttl             = 4
 local i_ttr             = 5
 local i_pri             = 6
 local i_created         = 7
-local i_data            = 8
+local i_taken           = 8
+local i_data            = 9
 
 local function is_expired(task)
     local dead_event = task[i_created] + task[i_ttl]
@@ -54,11 +55,12 @@ function tube.create_space(space_name, opts)
         {name = 'ttr', type = num_type()},
         {name = 'pri', type = num_type()},
         {name = 'created', type = num_type()},
+        {name = 'taken', type = num_type()},
         {name = 'data', type = '*'}
     }
 
-    -- 1        2       3           4    5    6    7,       8
-    -- task_id, status, next_event, ttl, ttr, pri, created, data
+    -- 1        2       3           4    5    6    7,       8,     9
+    -- task_id, status, next_event, ttl, ttr, pri, created, taken, data
     local space = box.space[space_name]
     if if_not_exists and space then
         -- Validate the existing space.
@@ -235,6 +237,7 @@ function method.put(self, data, opts)
         util.time(ttr),
         pri,
         util.time(),
+        0,
         data
     }
     self:on_task_change(task, 'put')
@@ -283,9 +286,11 @@ function method.take(self)
 
     task = self.space:update(task[i_id], {
         { '=', i_status, state.TAKEN },
-        { '=', i_next_event, next_event  }
+        { '=', i_next_event, next_event },
+        { '+', i_taken, 1  }
     })
     self:on_task_change(task, 'take')
+
     return task
 end
 
