@@ -1,23 +1,27 @@
-local log      = require('log')
-local fiber    = require('fiber')
-local state    = require('queue.abstract.state')
+local log = require('log')
+local fiber = require('fiber')
+local state = require('queue.abstract.state')
 
-local util     = require('queue.util')
-local qc       = require('queue.compat')
+local util = require('queue.util')
+local qc = require('queue.compat')
 local num_type = qc.num_type
 local str_type = qc.str_type
 
 local tube = {}
 local method = {}
 
-local i_id              = 1
-local i_status          = 2
-local i_next_event      = 3
-local i_ttl             = 4
-local i_ttr             = 5
-local i_pri             = 6
-local i_created         = 7
-local i_data            = 8
+local i_id = 1
+local i_status = 2
+local i_next_event = 3
+local i_ttl = 4
+local i_ttr = 5
+local i_pri = 6
+local i_created = 7
+local i_taken = 8
+local i_site = 9
+local i_system = 10
+local i_type = 11
+local i_data = 12
 
 local function is_expired(task)
     local dead_event = task[i_created] + task[i_ttl]
@@ -27,7 +31,7 @@ end
 -- validate space of queue
 local function validate_space(space)
     -- check indexes
-    local indexes = {'task_id', 'status', 'watch'}
+    local indexes = { 'task_id', 'status', 'watch' }
     for _, index in pairs(indexes) do
         if space.index[index] == nil then
             error(string.format('space "%s" does not have "%s" index',
@@ -42,23 +46,27 @@ function tube.create_space(space_name, opts)
     opts.ttr = opts.ttr or opts.ttl
     opts.pri = opts.pri or 0
 
-    local space_opts         = {}
-    local if_not_exists      = opts.if_not_exists or false
-    space_opts.temporary     = opts.temporary or false
-    space_opts.engine        = opts.engine or 'memtx'
+    local space_opts = {}
+    local if_not_exists = opts.if_not_exists or false
+    space_opts.temporary = opts.temporary or false
+    space_opts.engine = opts.engine or 'memtx'
     space_opts.format = {
-        {name = 'task_id', type = num_type()},
-        {name = 'status', type = str_type()},
-        {name = 'next_event', type = num_type()},
-        {name = 'ttl', type = num_type()},
-        {name = 'ttr', type = num_type()},
-        {name = 'pri', type = num_type()},
-        {name = 'created', type = num_type()},
-        {name = 'data', type = '*'}
+        { name = 'task_id', type = num_type() },
+        { name = 'status', type = str_type() },
+        { name = 'next_event', type = num_type() },
+        { name = 'ttl', type = num_type() },
+        { name = 'ttr', type = num_type() },
+        { name = 'pri', type = num_type() },
+        { name = 'created', type = num_type() },
+        { name = 'taken', type = num_type() },
+        { name = 'site', type = str_type() },
+        { name = 'system', type = str_type() },
+        { name = 'type', type = str_type() },
+        { name = 'data', type = '*' }
     }
 
-    -- 1        2       3           4    5    6    7,       8
-    -- task_id, status, next_event, ttl, ttr, pri, created, data
+    -- 1        2       3           4    5    6    7,       8,     9,    10,     11,   12
+    -- task_id, status, next_event, ttl, ttr, pri, created, taken, site, system, type, data
     local space = box.space[space_name]
     if if_not_exists and space then
         -- Validate the existing space.
@@ -67,29 +75,34 @@ function tube.create_space(space_name, opts)
     end
 
     space = box.schema.create_space(space_name, space_opts)
+
+    box.schema.sequence.create('id_seq', { min = 1, start = 1, cycle = true, if_not_exists = true })
+
     space:create_index('task_id', {
-        type          = 'tree',
-        parts         = {i_id, num_type()}
-    })
+        type = 'tree',
+        parts = { i_id, num_type() },
+        unique = true,
+        sequence = 'id_seq' })
+
     space:create_index('status', {
-        type          = 'tree',
-        parts         = {i_status, str_type(), i_pri, num_type(), i_id, num_type()}
+        type = 'tree',
+        parts = { i_status, str_type(), i_pri, num_type(), i_id, num_type() }
     })
     space:create_index('watch', {
-        type          = 'tree',
-        parts         = {i_status, str_type(), i_next_event, num_type()},
-        unique        = false
+        type = 'tree',
+        parts = { i_status, str_type(), i_next_event, num_type() },
+        unique = false
     })
     return space
 end
 
 local delayed_state = { state.DELAYED }
-local ttl_states    = { state.READY, state.BURIED }
-local ttr_state     = { state.TAKEN }
+local ttl_states = { state.READY, state.BURIED }
+local ttr_state = { state.TAKEN }
 
-local function fifottl_fiber_iteration(self, processed)
-    local now       = util.time()
-    local task      = nil
+local function edr_fiber_iteration(self, processed)
+    local now = util.time()
+    local task = nil
     local estimated = util.MAX_TIMEOUT
 
     -- delayed tasks
@@ -110,7 +123,7 @@ local function fifottl_fiber_iteration(self, processed)
 
     -- ttl tasks
     for _, state in pairs(ttl_states) do
-        task = self.space.index.watch:min{ state }
+        task = self.space.index.watch:min { state }
         if task ~= nil and task[i_status] == state then
             if now >= task[i_next_event] then
                 task = self:delete(task[i_id]):transform(2, 1, state.DONE)
@@ -151,14 +164,14 @@ local function fifottl_fiber_iteration(self, processed)
 end
 
 -- watch fiber
-local function fifottl_fiber(self)
-    fiber.name('fifottl')
-    log.info("Started queue fifottl fiber")
+local function edr_fiber(self)
+    fiber.name('edr')
+    log.info("Started queue edr fiber")
     local processed = 0
 
     while true do
         if box.info.ro == false then
-            local stat, err = pcall(fifottl_fiber_iteration, self, processed)
+            local stat, err = pcall(edr_fiber_iteration, self, processed)
 
             if not stat and not (err.code == box.error.READONLY) then
                 log.error("error catched: %s", tostring(err))
@@ -170,7 +183,7 @@ local function fifottl_fiber(self)
         else
             -- When switching the master to the replica, the fiber will be stopped.
             if self.sync_chan:get(0.1) ~= nil then
-                log.info("Queue fifottl fiber was stopped")
+                log.info("Queue edr fiber was stopped")
                 break
             end
         end
@@ -181,21 +194,22 @@ end
 function tube.new(space, on_task_change, opts)
     validate_space(space)
 
-    on_task_change = on_task_change or (function() end)
+    on_task_change = on_task_change or (function()
+    end)
     local self = setmetatable({
-        space           = space,
-        on_task_change  = function(self, task, stats_data)
+        space = space,
+        on_task_change = function(self, task, stats_data)
             -- wakeup fiber
             if task ~= nil and self.fiber ~= nil then
                 self.cond:signal(self.fiber:id())
             end
             on_task_change(task, stats_data)
         end,
-        opts            = opts,
+        opts = opts,
     }, { __index = method })
 
-    self.cond  = qc.waiter()
-    self.fiber = fiber.create(fifottl_fiber, self)
+    self.cond = qc.waiter()
+    self.fiber = fiber.create(edr_fiber, self)
     self.sync_chan = fiber.channel()
 
     return self
@@ -208,8 +222,7 @@ end
 
 -- put task in space
 function method.put(self, data, opts)
-    local max = self.space.index.task_id:max()
-    local id = max and max[i_id] + 1 or 0
+    local id = box.sequence.id_seq:next()
 
     local status
     local ttl = opts.ttl or self.opts.ttl
@@ -227,7 +240,7 @@ function method.put(self, data, opts)
         next_event = util.event_time(ttl)
     end
 
-    local task = self.space:insert{
+    local task = self.space:insert {
         id,
         status,
         next_event,
@@ -235,6 +248,10 @@ function method.put(self, data, opts)
         util.time(ttr),
         pri,
         util.time(),
+        0,
+        opts.site,
+        opts.system,
+        opts.type,
         data
     }
     self:on_task_change(task, 'put')
@@ -244,15 +261,15 @@ end
 -- touch task
 function method.touch(self, id, delta)
     local ops = {
-        {'+', i_next_event, delta},
-        {'+', i_ttl,        delta},
-        {'+', i_ttr,        delta}
+        { '+', i_next_event, delta },
+        { '+', i_ttl, delta },
+        { '+', i_ttr, delta }
     }
     if delta == util.MAX_TIMEOUT then
         ops = {
-            {'=', i_next_event, delta},
-            {'=', i_ttl,        delta},
-            {'=', i_ttr,        delta}
+            { '=', i_next_event, delta },
+            { '=', i_ttl, delta },
+            { '=', i_ttr, delta }
         }
     end
     local task = self.space:update(id, ops)
@@ -264,7 +281,7 @@ end
 -- take task
 function method.take(self)
     local task = nil
-    for _, t in self.space.index.status:pairs({state.READY}) do
+    for _, t in self.space.index.status:pairs({ state.READY }) do
         if not is_expired(t) then
             task = t
             break
@@ -283,9 +300,11 @@ function method.take(self)
 
     task = self.space:update(task[i_id], {
         { '=', i_status, state.TAKEN },
-        { '=', i_next_event, next_event  }
+        { '=', i_next_event, next_event },
+        { '+', i_taken, 1 }
     })
     self:on_task_change(task, 'take')
+
     return task
 end
 
@@ -302,7 +321,7 @@ end
 
 -- release task
 function method.release(self, id, opts)
-    local task = self.space:get{id}
+    local task = self.space:get { id }
     if task == nil then
         return
     end
@@ -326,9 +345,9 @@ end
 function method.bury(self, id)
     -- The `i_next_event` should be updated because if the task has been
     -- "buried" after it was "taken" (and the task has "ttr") when the time in
-    -- `i_next_event` will be interpreted as "ttl" in `fifottl_fiber_iteration`
+    -- `i_next_event` will be interpreted as "ttl" in `edr_fiber_iteration`
     -- and the task will be deleted.
-    local task = self.space:get{id}
+    local task = self.space:get { id }
     if task == nil then
         return
     end
@@ -343,7 +362,7 @@ end
 -- unbury several tasks
 function method.kick(self, count)
     for i = 1, count do
-        local task = self.space.index.status:min{ state.BURIED }
+        local task = self.space.index.status:min { state.BURIED }
         if task == nil then
             return i - 1
         end
@@ -351,7 +370,7 @@ function method.kick(self, count)
             return i - 1
         end
 
-        task = self.space:update(task[i_id], {{ '=', i_status, state.READY }})
+        task = self.space:update(task[i_id], { { '=', i_status, state.READY } })
         self:on_task_change(task, 'kick')
     end
     return count
@@ -359,7 +378,7 @@ end
 
 -- peek task
 function method.peek(self, id)
-    return self.space:get{id}
+    return self.space:get { id }
 end
 
 -- get iterator to tasks in a certain state
@@ -375,7 +394,7 @@ function method.start(self)
     if self.fiber then
         return
     end
-    self.fiber = fiber.create(fifottl_fiber, self)
+    self.fiber = fiber.create(edr_fiber, self)
 end
 
 function method.stop(self)
